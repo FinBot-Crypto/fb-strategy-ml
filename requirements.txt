@@ -1,5 +1,5 @@
 ccxt
-redis
+nats-py
 pandas
 numpy
 scikit-learn
