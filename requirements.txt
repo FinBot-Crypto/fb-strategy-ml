@@ -1,0 +1,6 @@
+ccxt
+redis
+pandas
+numpy
+scikit-learn
+joblib
