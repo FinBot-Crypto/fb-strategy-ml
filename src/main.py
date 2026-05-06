@@ -142,6 +142,7 @@ class StrategyMLService:
 
                 features = self.compute_features(df)
                 mean_reversion_score = self.predict(tier, features)
+                logger.info(f"  {symbol} ({tier}) -> score={mean_reversion_score:.4f}")
 
                 if mean_reversion_score >= POST_SCORE_THRESHOLD:
                     evaluations.append({
