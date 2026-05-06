@@ -1,155 +1,61 @@
-# 🧠 fb-strategy-ml
+# fb-strategy-ml
 
-Microserviço responsável por avaliar **6 estratégias de ML independentes** em tempo real para predição de movimentos de preço.
+Microserviço de inferência LSTM para Mean Reversion em criptomoedas.
 
-## 🎯 Objetivo
+## Objetivo
 
-O `fb-strategy-ml` consome eventos de ativos selecionados (`market.updated`) e executa avaliações com os 6 modelos treinados:
-- **2 Estratégias**: Breakout (rompimento) e Mean Reversion (reversão à média)
-- **3 Versões cada**: v1 (Major), v2 (Strong Alt), v3 (High Volatility)
+Consome `market.updated` (fb-market-selection) e executa inferência com **3 modelos LSTM** treinados por tier:
+- **Major** (BTC, ETH) — V1
+- **Strong Alt** (SOL, MATIC, AVAX, LINK, DOGE, ADA, XRP) — V2
+- **High Volatility** (ARB, OP, LDO, ATOM, NEAR, INJ, PEPE, SHIB, MEME, GALA) — V3
 
-Cada modelo retorna um score (0.0-1.0) indicando a força do sinal para aquela estratégia.
+Cada modelo retorna score 0-1 = probabilidade do RSI subir em 12h.
 
-## 🚀 Funcionalidades
-
-- **Integração NATS JetStream**: Consome `market.updated` e publica em `strategies.evaluated`
-- **6 Modelos Independentes**: Cada um otimizado para seu tier e estratégia
-- **Avaliação Assíncrona**: Executa inferências em paralelo via asyncio
-- **Cache de Avaliações**: Persiste últimos scores no NATS KV Store (`ml_evaluations`)
-- **Robustez**: Tratamento de erros, retry automático, logging detalhado
-
-## 📊 Modelos Utilizados
-
-| Modelo | Estratégia | Tier | Período | Dados de Treino |
-|--------|-----------|------|--------|-----------------|
-| **breakout_v1** | Breakout | Major | Donchian 15 | BTC, ETH |
-| **breakout_v2** | Breakout | Strong Alt | Donchian 20 | SOL, MATIC, AVAX, LINK, DOGE, ADA, XRP |
-| **breakout_v3** | Breakout | High Vol | Donchian 30 | ARB, OP, LDO, ATOM, NEAR, INJ, PEPE, SHIB, MEME, GALA |
-| **mean_reversion_v1** | Mean Reversion | Major | SMA 20 | BTC, ETH |
-| **mean_reversion_v2** | Mean Reversion | Strong Alt | SMA 30 | SOL, MATIC, AVAX, LINK, DOGE, ADA, XRP |
-| **mean_reversion_v3** | Mean Reversion | High Vol | SMA 40 | ARB, OP, LDO, ATOM, NEAR, INJ, PEPE, SHIB, MEME, GALA |
-
-## 🔄 Fluxo de Dados
+## Fluxo
 
 ```
-market.updated (from fb-market-selection)
-    ↓
-assets: [
-  {symbol: "BTC/USDT", tier: "Major"},
-  {symbol: "SOL/USDT", tier: "Strong Alt"},
-  {symbol: "ARB/USDT", tier: "High Volatility"}
-]
-    ↓
-Para cada ativo:
-  ├─ Se tier=Major: avaliar com breakout_v1 + mean_reversion_v1
-  ├─ Se tier=Strong Alt: avaliar com breakout_v2 + mean_reversion_v2
-  └─ Se tier=High Vol: avaliar com breakout_v3 + mean_reversion_v3
-    ↓
-strategies.evaluated (published)
-    ↓
-[
-  {
-    "symbol": "BTC/USDT",
-    "tier": "Major",
-    "strategies": [
-      {"name": "breakout_v1", "score": 0.8},
-      {"name": "mean_reversion_v1", "score": 0.5}
-    ]
-  },
-  ...
-]
+market.updated (fb-market-selection, a cada 1h)
+  → fb-strategy-ml (event-driven)
+    → fetch 15m OHLCV (200 candles)
+    → compute RSI features
+    → LSTM.predict_proba → score 0-1
+    → publish strategies.evaluated
 ```
 
-## 🎯 Scores Esperados
+## Threshold de Produção
 
-Cada estratégia retorna um score (0.0-1.0):
-- **0.0-0.3**: Sinal fraco ou ausente
-- **0.3-0.6**: Sinal moderado (cautela)
-- **0.6-0.8**: Sinal forte (operação viável)
-- **0.8-1.0**: Sinal muito forte (alta confiança)
+| Condição | Sinal |
+|----------|-------|
+| RSI < 38 + score >= 0.65 | LONG |
 
-Exemplo:
-```json
-{
-  "symbol": "BTC/USDT",
-  "tier": "Major",
-  "strategies": [
-    {
-      "name": "breakout_v1",
-      "score": 0.85,
-      "description": "Preço rompeu máxima de 15 candles + RSI > 50"
-    },
-    {
-      "name": "mean_reversion_v1",
-      "score": 0.3,
-      "description": "RSI não está em sobre-venda"
-    }
-  ]
-}
-```
-
-## 🏗️ Arquitetura
+## Arquitetura
 
 ```
 src/
-├── main.py                      # Entry point: listener NATS
-├── config.py                    # Thresholds e constantes globais
-│
-├── strategies/                  # INFERÊNCIA DE CADA ESTRATÉGIA
-│   ├── breakout.py             # Avalia breakout_v1, v2, v3
-│   └── mean_reversion.py       # Avalia mean_reversion_v1, v2, v3
-│
-├── models/                      # GESTÃO DOS MODELOS TREINADOS
-│   ├── loader.py               # Carrega os 6 .joblib
-│   └── cache.py                # Cache em memória
-│
-└── shared/                      # CÓDIGO REUTILIZÁVEL
-    ├── indicators.py           # RSI, ATR, Donchian, Bollinger
-    ├── data_fetcher.py         # Binance API
-    └── utils.py                # Helpers diversos
+└── main.py    # NATS subscriber + LSTM inference
 ```
 
-## 🔑 Variáveis de Ambiente
+3 modelos `.pt` em `/app/models/`:
+- `model_mean_reversion_v1_lstm_Major.pt`
+- `model_mean_reversion_v1_lstm_StrongAlt.pt`
+- `model_mean_reversion_v1_lstm_HighVolatility.pt`
 
-| Variável | Descrição | Padrão |
-|----------|-----------|--------|
-| `NATS_URL` | Endereço do servidor NATS | `nats://crypto-nats:4222` |
-| `MODELS_DIR` | Diretório com modelos .joblib | `/app/models` |
-| `DATA_FETCH_TIMEOUT` | Timeout ao buscar dados (segundos) | `10` |
+## Features do Modelo
 
-## 📖 Como Funciona
+- **Input:** 144 candles de 15m (36h de contexto)
+- **Features:** rsi_14, rsi_smooth, rsi_14_4h
+- **Output:** probabilidade 0-1
+- **AUC:** 0.83 (Major), 0.82 (Strong Alt), 0.82 (High Vol)
 
-1. **Inicialização**: Carrega os 6 modelos (.joblib) do `MODELS_DIR`
-2. **Listener**: Aguarda mensagens em `market.updated`
-3. **Processamento**:
-   - Para cada ativo recebido, identifica seu tier
-   - Busca últimos 100 candles de 1h
-   - Calcula indicators (RSI, ATR, Donchian, Bollinger)
-   - Realiza predição com modelos apropriados
-   - Converte predições em scores (0.0-1.0)
-4. **Publicação**: Publica resultado em `strategies.evaluated`
-5. **Cache**: Atualiza KV Store para dashboard
-
-## 🚀 Deploy
+## Deploy
 
 ```bash
-# Build
-docker build -t fb-strategy-ml:latest .
-
-# Run
-docker run \
-  -e NATS_URL=nats://crypto-nats:4222 \
-  -v $(pwd)/models:/app/models \
+docker run -e NATS_URL=nats://crypto-nats:4222 \
+  -v crypto_ml_models:/app/models \
   fb-strategy-ml:latest
 ```
 
-## 📝 Mudanças da V1
+## Modelos
 
-- ❌ **Removido**: `trend_follower_v1` (não mais utilizado)
-- ✅ **Adicionado**: Versões v2 e v3 de Breakout e Mean Reversion
-- ✅ **Melhorado**: Separação clara de tier → versão
-- ✅ **Robusto**: Tratamento de erros, retry automático
-
----
-
-*FinBot-Crypto - ML Intelligence Layer (Enterprise-Grade)*
+Treinados via `fb-ml-training` no Google Colab com 6400 candles de 15m (~67 dias).
+Atualizados via GitHub Actions quando novo modelo é commitado.
