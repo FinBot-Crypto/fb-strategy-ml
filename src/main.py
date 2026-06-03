@@ -23,6 +23,12 @@ MODEL_FILES = {
     "High Volatility": "model_mean_reversion_v1_lstm_HighVolatility.pt",
 }
 
+SHORT_MODEL_FILES = {
+    "Major": "model_short_lstm_Major.pt",
+    "Strong Alt": "model_short_lstm_StrongAlt.pt",
+    "High Volatility": "model_short_lstm_HighVolatility.pt",
+}
+
 POST_SCORE_THRESHOLD = float(os.getenv("POST_SCORE_THRESHOLD", "0.3"))
 
 
@@ -42,6 +48,7 @@ class StrategyMLService:
         self.nc = None
         self.js = None
         self.models = {}
+        self.short_models = {}
         self.exchange = ccxt.binance({"enableRateLimit": True})
         self._load_models()
 
@@ -49,7 +56,7 @@ class StrategyMLService:
         for tier, fname in MODEL_FILES.items():
             path = os.path.join(MODELS_DIR, fname)
             if not os.path.exists(path):
-                logger.warning(f"Modelo nao encontrado: {path}")
+                logger.warning(f"Modelo LONG nao encontrado: {path}")
                 continue
             ckpt = torch.load(path, map_location="cpu", weights_only=False)
             cfg = ckpt.get("config", {})
@@ -57,7 +64,20 @@ class StrategyMLService:
             model.load_state_dict(ckpt["model_state_dict"])
             model.eval()
             self.models[tier] = {"model": model, "seq_len": cfg.get("seq_len", SEQ_LEN)}
-            logger.info(f"Modelo carregado: {tier} ({fname})")
+            logger.info(f"Modelo LONG carregado: {tier} ({fname})")
+
+        for tier, fname in SHORT_MODEL_FILES.items():
+            path = os.path.join(MODELS_DIR, fname)
+            if not os.path.exists(path):
+                logger.warning(f"Modelo SHORT nao encontrado: {path}")
+                continue
+            ckpt = torch.load(path, map_location="cpu", weights_only=False)
+            cfg = ckpt.get("config", {})
+            model = LSTMMeanReversion(3, cfg.get("hidden", 128), cfg.get("layers", 1))
+            model.load_state_dict(ckpt["model_state_dict"])
+            model.eval()
+            self.short_models[tier] = {"model": model, "seq_len": cfg.get("seq_len", SEQ_LEN)}
+            logger.info(f"Modelo SHORT carregado: {tier} ({fname})")
 
     async def connect_nats(self):
         while True:
@@ -113,12 +133,21 @@ class StrategyMLService:
         return features[-SEQ_LEN:]  # ultimos SEQ_LEN candles
 
     def predict(self, tier: str, features: np.ndarray) -> float:
-        """Prediz probabilidade do RSI subir em 12h."""
         if tier not in self.models:
             return 0.5
         model = self.models[tier]["model"]
         seq_len = self.models[tier]["seq_len"]
-        X = torch.from_numpy(features[-seq_len:]).unsqueeze(0).float()  # (1, seq, 3)
+        X = torch.from_numpy(features[-seq_len:]).unsqueeze(0).float()
+        with torch.no_grad():
+            proba = model(X).item()
+        return round(proba, 4)
+
+    def predict_short(self, tier: str, features: np.ndarray) -> float:
+        if tier not in self.short_models:
+            return 0.5
+        model = self.short_models[tier]["model"]
+        seq_len = self.short_models[tier]["seq_len"]
+        X = torch.from_numpy(features[-seq_len:]).unsqueeze(0).float()
         with torch.no_grad():
             proba = model(X).item()
         return round(proba, 4)
@@ -133,7 +162,9 @@ class StrategyMLService:
                 symbol = asset["symbol"]
                 tier = asset.get("tier", "Major")
 
-                if tier not in self.models:
+                has_long = tier in self.models
+                has_short = tier in self.short_models
+                if not has_long and not has_short:
                     continue
 
                 df = await self.fetch_data(symbol)
@@ -141,16 +172,24 @@ class StrategyMLService:
                     continue
 
                 features = self.compute_features(df)
-                mean_reversion_score = self.predict(tier, features)
-                logger.info(f"  {symbol} ({tier}) -> score={mean_reversion_score:.4f}")
+                long_score = self.predict(tier, features) if has_long else None
+                short_score = self.predict_short(tier, features) if has_short else None
 
-                if mean_reversion_score >= POST_SCORE_THRESHOLD:
+                strategies = []
+                if long_score is not None:
+                    strategies.append({"name": "mean_reversion_long", "score": long_score, "direction": "LONG"})
+                if short_score is not None:
+                    strategies.append({"name": "mean_reversion_short", "score": short_score, "direction": "SHORT"})
+
+                logger.info(f"  {symbol} ({tier}) -> long={long_score} short={short_score}")
+
+                posts = long_score is not None and long_score >= POST_SCORE_THRESHOLD
+                posts = posts or (short_score is not None and short_score >= POST_SCORE_THRESHOLD)
+                if posts:
                     evaluations.append({
                         "symbol": symbol,
                         "tier": tier,
-                        "strategies": [
-                            {"name": f"mean_reversion_v{tier.replace(' ','_')}", "score": mean_reversion_score, "tier": tier}
-                        ],
+                        "strategies": strategies,
                         "timestamp": asset.get("timestamp", ""),
                     })
 
@@ -166,7 +205,7 @@ class StrategyMLService:
     async def run(self):
         await self.connect_nats()
         await self.js.subscribe("market.updated", durable="STRATEGY_ML_WORKER", cb=self.process_market_update, manual_ack=True)
-        logger.info(f"fb-strategy-ml (LSTM) online - modelos: {list(self.models.keys())}")
+        logger.info(f"fb-strategy-ml (LSTM) online - LONG: {list(self.models.keys())} | SHORT: {list(self.short_models.keys())}")
         while True:
             if self.nc.is_closed:
                 await self.connect_nats()
