@@ -154,8 +154,14 @@ class StrategyMLService:
 
     async def process_market_update(self, msg):
         try:
-            assets = json.loads(msg.data.decode())
-            logger.info(f"Processando {len(assets)} ativos do Market Selection")
+            data = json.loads(msg.data.decode())
+            if isinstance(data, dict):
+                assets = data.get("assets", [])
+                btc_trend = data.get("btc_trend", "neutral")
+            else:
+                assets = data
+                btc_trend = "neutral"
+            logger.info(f"Processando {len(assets)} ativos [BTC: {btc_trend}]")
             evaluations = []
 
             for asset in assets:
