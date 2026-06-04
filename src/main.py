@@ -108,8 +108,9 @@ class StrategyMLService:
             return None
 
     def compute_features(self, df: pd.DataFrame) -> np.ndarray:
-        """Computa 7 features: 3 RSI + 4 BTC SMA ratios."""
+        """Computa 12 features: 3 RSI + BTC RSI + 4 BTC SMA + 2 funding + 2 OI."""
         close = df["close"].values
+        n = len(close)
 
         # RSI features (3)
         delta = np.diff(close, prepend=close[0])
@@ -121,28 +122,57 @@ class StrategyMLService:
         rsi_smooth = pd.Series(rsi_14).ewm(span=2, adjust=False).mean().values
         rsi_4h = pd.Series(rsi_14).rolling(16).mean().values
 
-        # Normalize RSI features
         feats = np.column_stack([
             (rsi_14 - 50) / 10,
             (rsi_smooth - 50) / 10,
             (rsi_4h - 50) / 10,
         ])
 
-        # BTC SMA features (4)
-        btc_sma_features = np.zeros((len(close), 4))
+        # BTC features (5): RSI + 4 SMA ratios
+        btc_feats = np.zeros((n, 5))
         try:
             btc_ohlcv = self.exchange.fetch_ohlcv("BTC/USDT", "1h", limit=60)
             if btc_ohlcv and len(btc_ohlcv) >= 50:
                 btc_closes = np.array([c[4] for c in btc_ohlcv])
                 btc_current = btc_closes[-1]
-                for j, period in enumerate([12, 24, 36, 48]):
-                    if len(btc_closes) >= period:
-                        sma_val = btc_closes[-period:].mean()
-                        btc_sma_features[:, j] = btc_current / max(sma_val, 1)
+                # BTC RSI
+                btc_delta = np.diff(btc_closes, prepend=btc_closes[0])
+                btc_g = np.maximum(btc_delta, 0)
+                btc_l = -np.minimum(btc_delta, 0)
+                btc_ag = pd.Series(btc_g).rolling(14).mean().values
+                btc_al = pd.Series(btc_l).rolling(14).mean().values
+                btc_rsi = 100 - 100 / (1 + btc_ag / (btc_al + 1e-10))
+                btc_feats[:, 0] = (btc_rsi[-1] - 50) / 10
+                # BTC SMA ratios
+                for j, p in enumerate([12, 24, 36, 48]):
+                    if len(btc_closes) >= p:
+                        btc_feats[:, j + 1] = btc_current / max(btc_closes[-p:].mean(), 1)
         except Exception:
             pass
+        feats = np.hstack([feats, btc_feats])
 
-        feats = np.hstack([feats, btc_sma_features])
+        # Funding + OI (3 features, zeros if unavailable)
+        extra = np.zeros((n, 3))
+        try:
+            if not hasattr(self, '_futures_ex'):
+                self._futures_ex = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "future"}})
+            # Funding rate
+            fr_data = self._futures_ex.fetch_funding_rate_history(symbol, limit=2)
+            if fr_data and len(fr_data) >= 2:
+                fr = float(fr_data[-1].get('fundingRate', 0))
+                fr_prev = float(fr_data[-2].get('fundingRate', 0))
+                extra[:, 0] = fr * 10000
+                extra[:, 1] = (fr - fr_prev) * 10000
+            # Open interest
+            oi_data = self.exchange.fetch_open_interest_history(symbol, "1h", limit=2)
+            if oi_data and len(oi_data) >= 2:
+                oi = float(oi_data[-1].get('openInterestAmount', 0))
+                oi_prev = float(oi_data[-2].get('openInterestAmount', 0))
+                extra[:, 2] = (oi / max(oi_prev, 1) - 1) * 100
+        except Exception:
+            pass
+        feats = np.hstack([feats, extra])
+
         feats = np.nan_to_num(feats, nan=0.0)
         return feats[-SEQ_LEN:]
 
