@@ -151,8 +151,8 @@ class StrategyMLService:
             pass
         feats = np.hstack([feats, btc_feats])
 
-        # Funding + OI (3 features, zeros if unavailable)
-        extra = np.zeros((n, 3))
+        # Funding + OI (4 features, zeros if unavailable)
+        extra = np.zeros((n, 4))
         try:
             if not hasattr(self, '_futures_ex'):
                 self._futures_ex = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "future"}})
@@ -163,12 +163,17 @@ class StrategyMLService:
                 fr_prev = float(fr_data[-2].get('fundingRate', 0))
                 extra[:, 0] = fr * 10000
                 extra[:, 1] = (fr - fr_prev) * 10000
-            # Open interest
-            oi_data = self.exchange.fetch_open_interest_history(symbol, "1h", limit=2)
-            if oi_data and len(oi_data) >= 2:
-                oi = float(oi_data[-1].get('openInterestAmount', 0))
-                oi_prev = float(oi_data[-2].get('openInterestAmount', 0))
+            # Open interest (1h + 24h)
+            oi_data_1h = self.exchange.fetch_open_interest_history(symbol, "1h", limit=2)
+            oi_data_24h = self.exchange.fetch_open_interest_history(symbol, "1h", limit=25)
+            if oi_data_1h and len(oi_data_1h) >= 2:
+                oi = float(oi_data_1h[-1].get('openInterestAmount', 0))
+                oi_prev = float(oi_data_1h[-2].get('openInterestAmount', 0))
                 extra[:, 2] = (oi / max(oi_prev, 1) - 1) * 100
+            if oi_data_24h and len(oi_data_24h) >= 25:
+                oi = float(oi_data_24h[-1].get('openInterestAmount', 0))
+                oi_24h_ago = float(oi_data_24h[-25].get('openInterestAmount', 0))
+                extra[:, 3] = (oi / max(oi_24h_ago, 1) - 1) * 100
         except Exception:
             pass
         feats = np.hstack([feats, extra])
