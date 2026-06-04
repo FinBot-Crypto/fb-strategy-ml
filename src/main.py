@@ -60,11 +60,12 @@ class StrategyMLService:
                 continue
             ckpt = torch.load(path, map_location="cpu", weights_only=False)
             cfg = ckpt.get("config", {})
-            model = LSTMMeanReversion(3, cfg.get("hidden", 128), cfg.get("layers", 1))
+            nf = cfg.get("n_features", 3)
+            model = LSTMMeanReversion(nf, cfg.get("hidden", 128), cfg.get("layers", 1))
             model.load_state_dict(ckpt["model_state_dict"])
             model.eval()
-            self.models[tier] = {"model": model, "seq_len": cfg.get("seq_len", SEQ_LEN)}
-            logger.info(f"Modelo LONG carregado: {tier} ({fname})")
+            self.models[tier] = {"model": model, "seq_len": cfg.get("seq_len", SEQ_LEN), "n_features": nf}
+            logger.info(f"Modelo LONG carregado: {tier} ({fname}) nf={nf}")
 
         for tier, fname in SHORT_MODEL_FILES.items():
             path = os.path.join(MODELS_DIR, fname)
@@ -73,11 +74,12 @@ class StrategyMLService:
                 continue
             ckpt = torch.load(path, map_location="cpu", weights_only=False)
             cfg = ckpt.get("config", {})
-            model = LSTMMeanReversion(3, cfg.get("hidden", 128), cfg.get("layers", 1))
+            nf = cfg.get("n_features", 3)
+            model = LSTMMeanReversion(nf, cfg.get("hidden", 128), cfg.get("layers", 1))
             model.load_state_dict(ckpt["model_state_dict"])
             model.eval()
-            self.short_models[tier] = {"model": model, "seq_len": cfg.get("seq_len", SEQ_LEN)}
-            logger.info(f"Modelo SHORT carregado: {tier} ({fname})")
+            self.short_models[tier] = {"model": model, "seq_len": cfg.get("seq_len", SEQ_LEN), "n_features": nf}
+            logger.info(f"Modelo SHORT carregado: {tier} ({fname}) nf={nf}")
 
     async def connect_nats(self):
         while True:
@@ -106,50 +108,66 @@ class StrategyMLService:
             return None
 
     def compute_features(self, df: pd.DataFrame) -> np.ndarray:
-        """Computa as 3 features RSI e normaliza."""
+        """Computa 7 features: 3 RSI + 4 BTC SMA ratios."""
         close = df["close"].values
 
-        # RSI (period 56 = 14h em 15m)
+        # RSI features (3)
         delta = np.diff(close, prepend=close[0])
         gain = np.maximum(delta, 0)
         loss = -np.minimum(delta, 0)
         avg_gain = pd.Series(gain).rolling(RSI_PERIOD).mean().values
         avg_loss = pd.Series(loss).rolling(RSI_PERIOD).mean().values
         rsi_14 = 100 - 100 / (1 + avg_gain / (avg_loss + 1e-10))
-
-        # RSI smooth (EMA 2)
         rsi_smooth = pd.Series(rsi_14).ewm(span=2, adjust=False).mean().values
-
-        # RSI 4h (rolling mean de 16 candles de 15m)
         rsi_4h = pd.Series(rsi_14).rolling(16).mean().values
 
-        # Normalizar com stats aproximados (RSI ~ N(50,10))
-        features = np.column_stack([
+        # Normalize RSI features
+        feats = np.column_stack([
             (rsi_14 - 50) / 10,
             (rsi_smooth - 50) / 10,
             (rsi_4h - 50) / 10,
         ])
-        features = np.nan_to_num(features, nan=0.0)
-        return features[-SEQ_LEN:]  # ultimos SEQ_LEN candles
+
+        # BTC SMA features (4)
+        btc_sma_features = np.zeros((len(close), 4))
+        try:
+            btc_ohlcv = self.exchange.fetch_ohlcv("BTC/USDT", "1h", limit=60)
+            if btc_ohlcv and len(btc_ohlcv) >= 50:
+                btc_closes = np.array([c[4] for c in btc_ohlcv])
+                btc_current = btc_closes[-1]
+                for j, period in enumerate([12, 24, 36, 48]):
+                    if len(btc_closes) >= period:
+                        sma_val = btc_closes[-period:].mean()
+                        btc_sma_features[:, j] = btc_current / max(sma_val, 1)
+        except Exception:
+            pass
+
+        feats = np.hstack([feats, btc_sma_features])
+        feats = np.nan_to_num(feats, nan=0.0)
+        return feats[-SEQ_LEN:]
 
     def predict(self, tier: str, features: np.ndarray) -> float:
         if tier not in self.models:
             return 0.5
-        model = self.models[tier]["model"]
-        seq_len = self.models[tier]["seq_len"]
-        X = torch.from_numpy(features[-seq_len:]).unsqueeze(0).float()
+        m = self.models[tier]
+        nf = m.get("n_features", 3)
+        seq_len = m["seq_len"]
+        feats = features[-seq_len:, :nf]
+        X = torch.from_numpy(feats).unsqueeze(0).float()
         with torch.no_grad():
-            proba = model(X).item()
+            proba = m["model"](X).item()
         return round(proba, 4)
 
     def predict_short(self, tier: str, features: np.ndarray) -> float:
         if tier not in self.short_models:
             return 0.5
-        model = self.short_models[tier]["model"]
-        seq_len = self.short_models[tier]["seq_len"]
-        X = torch.from_numpy(features[-seq_len:]).unsqueeze(0).float()
+        m = self.short_models[tier]
+        nf = m.get("n_features", 3)
+        seq_len = m["seq_len"]
+        feats = features[-seq_len:, :nf]
+        X = torch.from_numpy(feats).unsqueeze(0).float()
         with torch.no_grad():
-            proba = model(X).item()
+            proba = m["model"](X).item()
         return round(proba, 4)
 
     async def process_market_update(self, msg):
