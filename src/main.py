@@ -263,12 +263,21 @@ class StrategyMLService:
 
     async def run(self):
         await self.connect_nats()
-        await self.js.subscribe("market.updated", durable="STRATEGY_ML_WORKER", cb=self.process_market_update, manual_ack=True)
+        self._processing = False  # Guard against concurrent executions
+        await self.js.subscribe(
+            "market.updated",
+            durable="STRATEGY_ML_WORKER",
+            cb=self.process_market_update,
+            manual_ack=True,
+            pending_msgs_limit=512,
+            pending_bytes_limit=64 * 1024 * 1024  # 64 MB
+        )
         logger.info(f"fb-strategy-ml (LSTM) online - LONG: {list(self.models.keys())} | SHORT: {list(self.short_models.keys())}")
         while True:
             if self.nc.is_closed:
                 await self.connect_nats()
             await asyncio.sleep(10)
+
 
 
 if __name__ == "__main__":
